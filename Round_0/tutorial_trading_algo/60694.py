@@ -134,9 +134,7 @@ class Logger:
 
         return out
 
-
 logger = Logger()
-
 
 class Trader:
     LIMITS = {
