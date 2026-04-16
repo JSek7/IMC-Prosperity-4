@@ -4,7 +4,6 @@ import json
 import math
 
 
-
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
@@ -19,12 +18,14 @@ class Logger:
         orders: Dict[Symbol, List[Order]],
         conversions: int,
         trader_data: str,
+        debug_info: Dict[str, Any],
     ) -> None:
         base_length = len(
             self.to_json(
                 [
                     self.compress_state(state, ""),
                     self.compress_orders(orders),
+                    debug_info,
                     conversions,
                     "",
                     "",
@@ -39,6 +40,7 @@ class Logger:
                 [
                     self.compress_state(state, self.truncate(state.traderData, max_item_length)),
                     self.compress_orders(orders),
+                    debug_info,
                     conversions,
                     self.truncate(trader_data, max_item_length),
                     self.truncate(self.logs, max_item_length),
@@ -61,31 +63,23 @@ class Logger:
         ]
 
     def compress_listings(self, listings: Dict[Symbol, Listing]) -> List[List[Any]]:
-        compressed = []
-        for listing in listings.values():
-            compressed.append([listing.symbol, listing.product, listing.denomination])
-        return compressed
+        return [[listing.symbol, listing.product, listing.denomination] for listing in listings.values()]
 
     def compress_order_depths(self, order_depths: Dict[Symbol, OrderDepth]) -> Dict[Symbol, List[Any]]:
-        compressed = {}
-        for symbol, order_depth in order_depths.items():
-            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
-        return compressed
+        return {symbol: [od.buy_orders, od.sell_orders] for symbol, od in order_depths.items()}
 
     def compress_trades(self, trades: Dict[Symbol, List[Trade]]) -> List[List[Any]]:
         compressed = []
         for arr in trades.values():
             for trade in arr:
-                compressed.append(
-                    [
-                        trade.symbol,
-                        trade.price,
-                        trade.quantity,
-                        trade.buyer,
-                        trade.seller,
-                        trade.timestamp,
-                    ]
-                )
+                compressed.append([
+                    trade.symbol,
+                    trade.price,
+                    trade.quantity,
+                    trade.buyer,
+                    trade.seller,
+                    trade.timestamp,
+                ])
         return compressed
 
     def compress_observations(self, observations: Observation) -> List[Any]:
@@ -134,6 +128,7 @@ class Logger:
 
         return out
 
+
 logger = Logger()
 
 class Trader:
@@ -158,13 +153,13 @@ class Trader:
         "trend_mult": 0.2,
     },
     "ASH_COATED_OSMIUM": {
-        "take_edge": 1.0,
+        "take_edge": 1.5,
         "typical_spread": 8.0,
-        "clip": 15,
+        "clip": 10,
         "vol_mult": 1.2,
-        "inv_skew": 0.15,
+        "inv_skew": 0.25,
         "imbalance_mult": 0.5,
-        "hard_pos": 65,
+        "hard_pos": 50,
         "fast_alpha": 0.24,
         "slow_alpha": 0.07,
         "trend_mult": 0.50,
@@ -387,6 +382,7 @@ class Trader:
         orders: List[Order],
         buy_used: int,
         sell_used: int,
+        debug_info: Dict[str, Any],
     ) -> Tuple[int, int]:
 
         symbol = "INTARIAN_PEPPER_ROOT"
@@ -405,12 +401,20 @@ class Trader:
         best_bid, best_ask = self.best_bid_ask(order_depth)
 
         if centre is None:
+            debug_info[symbol] = {
+                "our_bid": None,
+                "our_ask": None,
+                "bid_size": 0,
+                "ask_size": 0,
+                "position": pos + buy_used - sell_used,
+                "regime": regime,
+                "signal": signal,
+                "centre": None,
+            }
             return buy_used, sell_used
 
         current_pos = pos + buy_used - sell_used
 
-        # Directional inventory skew:
-        # long inventory is tolerated more, short inventory punished more
         if current_pos >= 0:
             pos_skew = params["inv_skew_long"] * current_pos
         else:
@@ -420,7 +424,6 @@ class Trader:
         if best_bid is not None and best_ask is not None:
             spread = best_ask - best_bid
 
-        # Liquid book
         if best_bid is not None and best_ask is not None and spread is not None and spread <= params["wide_spread"]:
             bid_quote = best_bid + 1
             ask_quote = best_ask - 1
@@ -428,8 +431,6 @@ class Trader:
             if bid_quote >= ask_quote:
                 bid_quote = best_bid
                 ask_quote = best_ask
-
-        # Sparse / wide book
         else:
             half_spread = params["typical_spread"] // 2
 
@@ -453,7 +454,6 @@ class Trader:
                 bid_quote = c - 3
                 ask_quote = c + 3
 
-        # Apply inventory skew
         bid_quote = math.floor(bid_quote - pos_skew)
         ask_quote = math.ceil(ask_quote - pos_skew)
 
@@ -467,7 +467,6 @@ class Trader:
 
         passive_clip = max(1, params["clip"] // 2)
 
-        # Regime-based target for maker overlay
         if regime == "long":
             if signal > 3.0:
                 target_pos = 70
@@ -490,7 +489,6 @@ class Trader:
         buy_qty = passive_clip
         sell_qty = passive_clip
 
-        # Directional asymmetry
         if regime == "long":
             if current_pos < target_pos - 5:
                 sell_qty = 0
@@ -502,7 +500,6 @@ class Trader:
                 ask_quote += 2
 
         elif regime == "short":
-            # allow shorting, but less aggressively
             if current_pos > target_pos + 3:
                 buy_qty = 0
                 sell_qty = min(sell_cap, passive_clip + 1)
@@ -511,7 +508,6 @@ class Trader:
                 buy_qty = max(0, passive_clip - 5)
                 sell_qty = min(sell_cap, passive_clip)
 
-        # Hard asymmetric limits
         if current_pos >= params["hard_long"]:
             buy_qty = 0
             sell_qty = min(sell_cap, passive_clip + 4)
@@ -523,6 +519,17 @@ class Trader:
         buy_qty = min(buy_qty, buy_cap)
         sell_qty = min(sell_qty, sell_cap)
 
+        debug_info[symbol] = {
+            "our_bid": bid_quote if buy_qty > 0 else None,
+            "our_ask": ask_quote if sell_qty > 0 else None,
+            "bid_size": buy_qty,
+            "ask_size": sell_qty,
+            "position": current_pos,
+            "regime": regime,
+            "signal": signal,
+            "centre": round(centre, 3),
+        }
+
         if buy_qty > 0:
             buy_used, sell_used = self.place_buy(
                 orders, symbol, bid_quote, buy_qty, limit, pos, buy_used, sell_used
@@ -533,8 +540,7 @@ class Trader:
             )
 
         return buy_used, sell_used
-        
-    
+            
     def root_signal_and_regime(self, data: Dict[str, Any]) -> Tuple[float, str]:
         symbol = "INTARIAN_PEPPER_ROOT"
 
@@ -709,7 +715,7 @@ class Trader:
 
         return buy_used, sell_used
     
-    def trade_root(self, state: TradingState, data: Dict[str, Any]) -> List[Order]:
+    def trade_root(self, state: TradingState, data: Dict[str, Any], debug_info: Dict[str, Any]) -> List[Order]:
         if "INTARIAN_PEPPER_ROOT" not in state.order_depths:
             return []
 
@@ -750,9 +756,9 @@ class Trader:
                 order_depth, data, pos, orders, buy_used, sell_used
             )
 
-        # Then maker overlay
+
         buy_used, sell_used = self.make_root(
-            order_depth, data, pos, orders, buy_used, sell_used
+            order_depth, data, pos, orders, buy_used, sell_used, debug_info
         )
 
         logger.print(
@@ -763,183 +769,241 @@ class Trader:
         return orders
 
 # =================== OSMIUM =====================================
- 
     def osmium_fair(self, order_depth: OrderDepth, data: Dict[str, Any]) -> Optional[float]:
-        params = self.PARAMS["ASH_COATED_OSMIUM"]
-
         best_bid, best_ask = self.best_bid_ask(order_depth)
         micro = self.microprice(order_depth)
         mid = self.mid_price(order_depth)
-        imbalance = self.book_imbalance(order_depth, levels=3)
-
         prev_fair = data["osmium_fair"].get("last_fair")
 
-        # Full book available
-        if micro is not None and mid is not None:
-            anchor = prev_fair if prev_fair is not None else mid
+        anchor = 10000.0
 
-            fair = (
-                0.2 * micro
-                + 0.1 * mid
-                + 0.7 * anchor
-                #+ params["imbalance_mult"] * 0.2 * imbalance
-            )
+        if micro is not None and mid is not None:
+            spread = best_ask - best_bid if best_bid is not None and best_ask is not None else 8
+
+            if spread <= 3:
+                micro_w, anchor_w = 0.55, 0.45
+            elif spread <= 6:
+                micro_w, anchor_w = 0.45, 0.55
+            else:
+                micro_w, anchor_w = 0.30, 0.70
+
+            fair = micro_w * micro + anchor_w * anchor
+
+            if prev_fair is not None:
+                fair = 0.7 * fair + 0.3 * prev_fair
+
             return fair
 
-        # One-sided or sparse book fallback
         if prev_fair is not None:
-            if best_bid is not None and best_ask is None:
-                return 0.9 * prev_fair + 0.1 * float(best_bid)
-            if best_ask is not None and best_bid is None:
-                return 0.9 * prev_fair + 0.1 * float(best_ask)
             return prev_fair
 
-        # Final fallback if no previous fair exists
-        if best_bid is not None:
-            return float(best_bid) - params["typical_spread"]//2
-        if best_ask is not None:
-            return float(best_ask) + params["typical_spread"]//2
+        return anchor
 
-        return None
     
-
-    def take_osmium(
-            self, 
-            order_depth: OrderDepth, 
-            data: Dict[str, Any],
-            orders: List[Order],
-            pos: int,
-            buy_used: int,
-            sell_used: int
-        ) -> Tuple[int, int]:   
-
-
-        limit = self.LIMITS["ASH_COATED_OSMIUM"]
-        params = self.PARAMS["ASH_COATED_OSMIUM"]
-        fair = self.osmium_fair(order_depth, data)
-        if fair is not None:
-            data["osmium_fair"]["last_fair"] = fair
-        elif fair is None:
-            return buy_used, sell_used
-        
-        # if ask price is sufficiently below fair or at fair with a long position, buy
-        for ask_price, ask_qty in self.sorted_asks(order_depth):
-            ask_qty = -ask_qty
-            current_pos = pos + buy_used - sell_used
-
-            if ask_price <= fair - params["take_edge"]:
-                qty = min(ask_qty, self.remaining_buy_capacity(limit, pos, buy_used, sell_used), params["clip"])
-                if qty <= 0:
-                     break
-                buy_used, sell_used = self.place_buy(
-                    orders, "ASH_COATED_OSMIUM", ask_price, qty, limit, pos, buy_used, sell_used
-                )
-            else:
-                break
-
-        # if bid price is sufficiently above fair or at fair with a short position, sell
-        for bid_price, bid_qty in self.sorted_bids(order_depth):
-            current_pos = pos + buy_used - sell_used
-
-            if bid_price > fair + params["take_edge"]:
-                qty = min(bid_qty, self.remaining_sell_capacity(limit, pos, buy_used, sell_used), params["clip"])
-                if qty <= 0:
-                    break
-                buy_used, sell_used = self.place_sell(
-                    orders, "ASH_COATED_OSMIUM", bid_price, qty, limit, pos, buy_used, sell_used
-                )
-            else:
-                break
-
-        return buy_used, sell_used
-    
-
     def make_osmium(
-            self, 
-            order_depth: OrderDepth, 
-            data: Dict[str, Any],
-            orders: List[Order],
-            pos: int,
-            buy_used: int,
-            sell_used: int
-        ) -> Tuple[int, int]:
-    
-        limit = self.LIMITS["ASH_COATED_OSMIUM"]
-        params = self.PARAMS["ASH_COATED_OSMIUM"]
+        self,
+        order_depth: OrderDepth,
+        data: Dict[str, Any],
+        orders: List[Order],
+        pos: int,
+        buy_used: int,
+        sell_used: int,
+        debug_info: Dict[str, Any]
+    ) -> Tuple[int, int]:
+
+        symbol = "ASH_COATED_OSMIUM"
+        limit = self.LIMITS[symbol]
+        params = self.PARAMS[symbol]
+
         fair = self.osmium_fair(order_depth, data)
-        data["osmium_fair"]["last_fair"] = fair
-        best_bid, best_ask = self.best_bid_ask(order_depth)
-
-        #calculate position skew
-        current_pos = pos + buy_used - sell_used
-        pos_skew = params["inv_skew"] * current_pos
-
-    
         if fair is None:
             return buy_used, sell_used
-        
-        # calculate own spread anchor based on volatility/skew/imbalance
 
-        if best_bid is not None:
-            bid_quote = best_bid + 1  # penny in front
-        else:
-            bid_quote = math.floor(fair - params["typical_spread"] / 2 - pos_skew)
+        data["osmium_fair"]["last_fair"] = fair
 
-        if best_ask is not None:
-            ask_quote = best_ask - 1  # penny in front
-        else:
-            ask_quote = math.ceil(fair + params["typical_spread"] / 2 - pos_skew)
+        current_pos = pos + buy_used - sell_used
+        best_bid, best_ask = self.best_bid_ask(order_depth)
+        micro = self.microprice(order_depth)
+        imbalance = self.book_imbalance(order_depth, levels=3)
 
-        # logic if no ask/no bid --> be less aggressive on the side with no liquidity, but anchor to fair
+        mid = self.mid_price(order_depth)
+        hist = data["price_hist"].setdefault(symbol, [])
+        if mid is not None:
+            hist.append(mid)
+            if len(hist) > 30:
+                hist.pop(0)
 
-        if best_ask is None and best_bid is not None:
-            ask_quote = ask_quote + 1
-        if best_bid is None and best_ask is not None:
-            bid_quote = bid_quote - 1
+        vol = self.realized_vol(hist)
+        micro_dev = 0.0 if micro is None else (micro - fair)
+        alpha = 0.35 * micro_dev + 0.45 * imbalance
 
-        # reset anchors if they are on the wrong side of the book
+        reservation = fair + alpha - params["inv_skew"] * current_pos
+
+        half_spread = (
+            params["typical_spread"] / 2
+            + 1.2 * vol
+            + 0.9 * abs(imbalance)
+            + 2.0 * abs(current_pos) / limit
+        )
+
+        bid_quote = math.floor(reservation - half_spread)
+        ask_quote = math.ceil(reservation + half_spread)
+
+        # Conditional pennying only
+        spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
+
+        if spread is not None and spread >= 3:
+            if alpha >= -0.2 and imbalance > -0.2 and best_bid is not None:
+                if reservation - (best_bid + 1) >= 0.5:
+                    bid_quote = max(bid_quote, best_bid + 1)
+
+            if alpha <= 0.2 and imbalance < 0.2 and best_ask is not None:
+                if (best_ask - 1) - reservation >= 0.5:
+                    ask_quote = min(ask_quote, best_ask - 1)
 
         if bid_quote >= ask_quote:
-            centre = int(round(fair))
-            bid_quote = centre - 1
-            ask_quote = centre + 1
-            
-        # if current pos is high but not above hard_pos --> increase size on the side that would reduce position and quote more towards fair
+            centre = int(round(reservation))
+            bid_quote = centre - 3
+            ask_quote = centre + 3
+
+        if bid_quote >= 10000 or ask_quote <= 10000:
+            centre = 10000
+            bid_quote = centre - 4
+            ask_quote = centre + 4
 
         buy_cap = self.remaining_buy_capacity(limit, pos, buy_used, sell_used)
         sell_cap = self.remaining_sell_capacity(limit, pos, buy_used, sell_used)
 
-        buy_clip = min(params["clip"], buy_cap)
-        sell_clip = min(params["clip"], sell_cap)
+        base_size = min(params["clip"], 8)
+        buy_clip = min(base_size, buy_cap)
+        sell_clip = min(base_size, sell_cap)
 
-        if current_pos > 18:
-            buy_clip = max(0, buy_clip - current_pos // 10)
-        elif current_pos < -18:
-            sell_clip = max(0, sell_clip - (-current_pos) // 10)
+        # Early inventory management
+        if current_pos > 10:
+            buy_clip = max(0, buy_clip - 2)
+            sell_clip = min(sell_cap, sell_clip + 1)
+            bid_quote -= 1
+        elif current_pos < -10:
+            sell_clip = max(0, sell_clip - 2)
+            buy_clip = min(buy_cap, buy_clip + 1)
+            ask_quote += 1
 
-
-        # if current pos is above hard_pos --> quote on sided and aggressively towards fair
+        if current_pos > 25:
+            buy_clip = 0
+            sell_clip = min(sell_cap, sell_clip + 2)
+        elif current_pos < -25:
+            sell_clip = 0
+            buy_clip = min(buy_cap, buy_clip + 2)
 
         if current_pos >= params["hard_pos"]:
             buy_clip = 0
-            sell_clip = min(sell_cap, max(sell_clip, params["clip"] + 5))
+            sell_clip = min(sell_cap, max(sell_clip, params["clip"]))
         elif current_pos <= -params["hard_pos"]:
             sell_clip = 0
-            buy_clip = min(buy_cap, max(buy_clip, params["clip"] + 5))
+            buy_clip = min(buy_cap, max(buy_clip, params["clip"]))
 
         if buy_clip > 0:
             buy_used, sell_used = self.place_buy(
-                orders, "ASH_COATED_OSMIUM", bid_quote, buy_clip, limit, pos, buy_used, sell_used
+                orders, symbol, bid_quote, buy_clip, limit, pos, buy_used, sell_used
             )
         if sell_clip > 0:
             buy_used, sell_used = self.place_sell(
-                orders, "ASH_COATED_OSMIUM", ask_quote, sell_clip, limit, pos, buy_used, sell_used
+                orders, symbol, ask_quote, sell_clip, limit, pos, buy_used, sell_used
             )
+
+        debug_info[symbol] = {
+            "our_bid": bid_quote if buy_clip > 0 else None,
+            "our_ask": ask_quote if sell_clip > 0 else None,
+            "bid_size": buy_clip,
+            "ask_size": sell_clip,
+            "position": current_pos,
+            "fair": round(fair, 3),
+            "signal": round(alpha, 3),
+            "imbalance": round(imbalance, 3),
+            "vol": round(vol, 3),
+            "reservation": round(reservation, 3),
+        }
+
+        return buy_used, sell_used
+
+    def take_osmium(
+        self,
+        order_depth: OrderDepth,
+        data: Dict[str, Any],
+        orders: List[Order],
+        pos: int,
+        buy_used: int,
+        sell_used: int
+    ) -> Tuple[int, int]:
+
+        symbol = "ASH_COATED_OSMIUM"
+        limit = self.LIMITS[symbol]
+        params = self.PARAMS[symbol]
+
+        fair = self.osmium_fair(order_depth, data)
+        if fair is None:
+            return buy_used, sell_used
+
+        data["osmium_fair"]["last_fair"] = fair
+
+        micro = self.microprice(order_depth)
+        imbalance = self.book_imbalance(order_depth, levels=3)
+        current_pos = pos + buy_used - sell_used
+
+        mid = self.mid_price(order_depth)
+        hist = data["price_hist"].setdefault(symbol, [])
+        if mid is not None:
+            hist.append(mid)
+            if len(hist) > 30:
+                hist.pop(0)
+
+        vol = self.realized_vol(hist)
+        micro_dev = 0.0 if micro is None else (micro - fair)
+        alpha = 0.35 * micro_dev + 0.45 * imbalance
+
+        buy_threshold = fair + alpha - (
+            params["take_edge"] + 0.5 * vol + 0.6 * max(0, current_pos) / limit
+        )
+        sell_threshold = fair + alpha + (
+            params["take_edge"] + 0.5 * vol + 0.6 * max(0, -current_pos) / limit
+        )
+
+        for ask_price, ask_qty in self.sorted_asks(order_depth):
+            ask_qty = -ask_qty
+            if ask_price <= buy_threshold:
+                edge = (fair + alpha) - ask_price
+                qty = min(
+                    ask_qty,
+                    self.remaining_buy_capacity(limit, pos, buy_used, sell_used),
+                    max(2, min(params["clip"], int(3 + 2 * edge)))
+                )
+                if qty <= 0:
+                    break
+                buy_used, sell_used = self.place_buy(
+                    orders, symbol, ask_price, qty, limit, pos, buy_used, sell_used
+                )
+            else:
+                break
+
+        for bid_price, bid_qty in self.sorted_bids(order_depth):
+            if bid_price >= sell_threshold:
+                edge = bid_price - (fair + alpha)
+                qty = min(
+                    bid_qty,
+                    self.remaining_sell_capacity(limit, pos, buy_used, sell_used),
+                    max(2, min(params["clip"], int(3 + 2 * edge)))
+                )
+                if qty <= 0:
+                    break
+                buy_used, sell_used = self.place_sell(
+                    orders, symbol, bid_price, qty, limit, pos, buy_used, sell_used
+                )
+            else:
+                break
 
         return buy_used, sell_used
     
-
-    def trade_osmium(self, state: TradingState, data: Dict[str, Any]) -> List[Order]:
+    def trade_osmium(self, state: TradingState, data: Dict[str, Any], debug_info: Dict[str, Any]) -> List[Order]:
         if "ASH_COATED_OSMIUM" not in state.order_depths:
             return []
 
@@ -955,7 +1019,7 @@ class Trader:
             order_depth, data, orders, pos, buy_used, sell_used
         )
         buy_used, sell_used = self.make_osmium(
-            order_depth, data, orders, pos, buy_used, sell_used
+            order_depth, data, orders, pos, buy_used, sell_used, debug_info
         )
 
         logger.print(
@@ -966,17 +1030,19 @@ class Trader:
 
     # ============================ RUN ==========================
 
+
     def run(self, state: TradingState):
         data = self.load_data(state.traderData)
         result: Dict[Symbol, List[Order]] = {}
+        debug_info: Dict[str, Any] = {}
 
         if "ASH_COATED_OSMIUM" in state.order_depths:
-            result["ASH_COATED_OSMIUM"] = self.trade_osmium(state, data)
+            result["ASH_COATED_OSMIUM"] = self.trade_osmium(state, data, debug_info)
 
-        if "INTARIAN_PEPPER_ROOT" in state.order_depths:
-            result["INTARIAN_PEPPER_ROOT"] = self.trade_root(state, data)
+        #if "INTARIAN_PEPPER_ROOT" in state.order_depths:
+            #result["INTARIAN_PEPPER_ROOT"] = self.trade_root(state, data, debug_info)
 
         trader_data = self.save_data(data)
         conversions = 0
-        logger.flush(state, result, conversions, trader_data)
+        logger.flush(state, result, conversions, trader_data, debug_info)
         return result, conversions, trader_data

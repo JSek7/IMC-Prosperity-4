@@ -4,7 +4,6 @@ import json
 import math
 
 
-
 class Logger:
     def __init__(self) -> None:
         self.logs = ""
@@ -19,12 +18,14 @@ class Logger:
         orders: Dict[Symbol, List[Order]],
         conversions: int,
         trader_data: str,
+        debug_info: Dict[str, Any],
     ) -> None:
         base_length = len(
             self.to_json(
                 [
                     self.compress_state(state, ""),
                     self.compress_orders(orders),
+                    debug_info,
                     conversions,
                     "",
                     "",
@@ -39,6 +40,7 @@ class Logger:
                 [
                     self.compress_state(state, self.truncate(state.traderData, max_item_length)),
                     self.compress_orders(orders),
+                    debug_info,
                     conversions,
                     self.truncate(trader_data, max_item_length),
                     self.truncate(self.logs, max_item_length),
@@ -61,31 +63,23 @@ class Logger:
         ]
 
     def compress_listings(self, listings: Dict[Symbol, Listing]) -> List[List[Any]]:
-        compressed = []
-        for listing in listings.values():
-            compressed.append([listing.symbol, listing.product, listing.denomination])
-        return compressed
+        return [[listing.symbol, listing.product, listing.denomination] for listing in listings.values()]
 
     def compress_order_depths(self, order_depths: Dict[Symbol, OrderDepth]) -> Dict[Symbol, List[Any]]:
-        compressed = {}
-        for symbol, order_depth in order_depths.items():
-            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
-        return compressed
+        return {symbol: [od.buy_orders, od.sell_orders] for symbol, od in order_depths.items()}
 
     def compress_trades(self, trades: Dict[Symbol, List[Trade]]) -> List[List[Any]]:
         compressed = []
         for arr in trades.values():
             for trade in arr:
-                compressed.append(
-                    [
-                        trade.symbol,
-                        trade.price,
-                        trade.quantity,
-                        trade.buyer,
-                        trade.seller,
-                        trade.timestamp,
-                    ]
-                )
+                compressed.append([
+                    trade.symbol,
+                    trade.price,
+                    trade.quantity,
+                    trade.buyer,
+                    trade.seller,
+                    trade.timestamp,
+                ])
         return compressed
 
     def compress_observations(self, observations: Observation) -> List[Any]:
@@ -134,6 +128,7 @@ class Logger:
 
         return out
 
+
 logger = Logger()
 
 class Trader:
@@ -142,37 +137,47 @@ class Trader:
         "ASH_COATED_OSMIUM": 80,
     }
 
-    PARAMS = {"INTARIAN_PEPPER_ROOT": {
+    PARAMS = {
+    "INTARIAN_PEPPER_ROOT": {
         "take_edge": 0.0,
         "typical_spread": 8.0,
-        "clip": 15,
-        "inv_skew": 0.10,
-        "hard_pos": 70,
+        "clip": 20,
+        "inv_skew_long": 0.03,
+        "inv_skew_short": 0.18,
+        "hard_long": 75,
+        "hard_short": 20,
         "wide_spread": 8,
         "target_scale": 12,
         "fast_alpha": 0.20,
         "slow_alpha": 0.05,
         "trend_mult": 0.2,
-},
-        "ASH_COATED_OSMIUM": {
-            "take_edge": 1.0,
-            "typical_spread": 8.0,
-            "clip": 20,
-            "vol_mult": 1.2,
-            "inv_skew": 0.18,
-            "imbalance_mult": 0.5,
-            "hard_pos": 65,
-            "fast_alpha": 0.24,
-            "slow_alpha": 0.07,
-            "trend_mult": 0.50,
-        },
-    }
+    },
+    "ASH_COATED_OSMIUM": {
+        "take_edge": 1.0,
+        "typical_spread": 8.0,
+        "clip": 15,
+        "vol_mult": 1.2,
+        "inv_skew": 0.25,
+        "imbalance_mult": 0.5,
+        "hard_pos": 65,
+        "fast_alpha": 0.24,
+        "slow_alpha": 0.07,
+        "trend_mult": 0.50,
+    },
+}
 
 # Helper functions for data manipulation and strategy logic
 
     def load_data(self, trader_data: str) -> Dict[str, Any]:
         if not trader_data:
-            return {"ema_fast": {}, "ema_slow": {}, "price_hist": {}, "osmium_fair": {}, "root_centre": {}}
+            return {
+                "ema_fast": {},
+                "ema_slow": {},
+                "price_hist": {},
+                "osmium_fair": {},
+                "root_centre": {},
+                "root_regime": "neutral",
+            }
 
         try:
             data = json.loads(trader_data)
@@ -189,9 +194,11 @@ class Trader:
             data["osmium_fair"] = {}
         if "root_centre" not in data:
             data["root_centre"] = {}
+        if "root_regime" not in data:
+            data["root_regime"] = "neutral"
 
         return data
-
+    
     def save_data(self, data: Dict[str, Any]) -> str:
         return json.dumps(data, separators=(",", ":"))
 
@@ -375,6 +382,7 @@ class Trader:
         orders: List[Order],
         buy_used: int,
         sell_used: int,
+        debug_info: Dict[str, Any],
     ) -> Tuple[int, int]:
 
         symbol = "INTARIAN_PEPPER_ROOT"
@@ -387,32 +395,42 @@ class Trader:
         if ema_fast is not None and ema_slow is not None:
             trend = ema_fast - ema_slow
 
+        signal, regime = self.root_signal_and_regime(data)
+
         centre = self.root_centre(order_depth, data)
         best_bid, best_ask = self.best_bid_ask(order_depth)
 
         if centre is None:
+            debug_info[symbol] = {
+                "our_bid": None,
+                "our_ask": None,
+                "bid_size": 0,
+                "ask_size": 0,
+                "position": pos + buy_used - sell_used,
+                "regime": regime,
+                "signal": signal,
+                "centre": None,
+            }
             return buy_used, sell_used
 
         current_pos = pos + buy_used - sell_used
-        pos_skew = params["inv_skew"] * current_pos
+
+        if current_pos >= 0:
+            pos_skew = params["inv_skew_long"] * current_pos
+        else:
+            pos_skew = params["inv_skew_short"] * current_pos
 
         spread = None
         if best_bid is not None and best_ask is not None:
             spread = best_ask - best_bid
-        
-        
 
-        # Liquid book — quote inside the spread to get fills
         if best_bid is not None and best_ask is not None and spread is not None and spread <= params["wide_spread"]:
             bid_quote = best_bid + 1
             ask_quote = best_ask - 1
 
-            # If spread is only 2, can't improve both sides — just join
             if bid_quote >= ask_quote:
                 bid_quote = best_bid
                 ask_quote = best_ask
-
-        # Thin/wide/one-sided book — use centre-based quoting
         else:
             half_spread = params["typical_spread"] // 2
 
@@ -436,7 +454,6 @@ class Trader:
                 bid_quote = c - 3
                 ask_quote = c + 3
 
-        # Apply inventory skew to both branches
         bid_quote = math.floor(bid_quote - pos_skew)
         ask_quote = math.ceil(ask_quote - pos_skew)
 
@@ -450,28 +467,68 @@ class Trader:
 
         passive_clip = max(1, params["clip"] // 2)
 
-        target_pos = max(-limit, min(limit, int(trend * params["target_scale"])))
+        if regime == "long":
+            if signal > 3.0:
+                target_pos = 70
+            elif signal > 2.0:
+                target_pos = 50
+            elif signal > 1.2:
+                target_pos = 25
+            else:
+                target_pos = 10
+        elif regime == "short":
+            if signal < -3.5:
+                target_pos = -20
+            elif signal < -2.5:
+                target_pos = -12
+            else:
+                target_pos = -6
+        else:
+            target_pos = 0
 
-        # Always quote both sides — use target to skew SIZE not existence
         buy_qty = passive_clip
         sell_qty = passive_clip
 
-        # Skew sizes toward target position
-        if current_pos < target_pos:
-            sell_qty = max(0, passive_clip - 2)
-        elif current_pos > target_pos:
-            buy_qty = max(0, passive_clip - 2)
+        if regime == "long":
+            if current_pos < target_pos - 5:
+                sell_qty = 0
+                buy_qty = min(buy_cap, passive_clip + 4)
+                ask_quote += 4
+            elif current_pos < target_pos:
+                sell_qty = max(0, passive_clip - 4)
+                buy_qty = min(buy_cap, passive_clip + 2)
+                ask_quote += 2
 
-        # Hard position limits
-        if current_pos >= params["hard_pos"]:
+        elif regime == "short":
+            if current_pos > target_pos + 3:
+                buy_qty = 0
+                sell_qty = min(sell_cap, passive_clip + 1)
+                bid_quote -= 2
+            elif current_pos > target_pos:
+                buy_qty = max(0, passive_clip - 5)
+                sell_qty = min(sell_cap, passive_clip)
+
+        if current_pos >= params["hard_long"]:
             buy_qty = 0
             sell_qty = min(sell_cap, passive_clip + 4)
-        elif current_pos <= -params["hard_pos"]:
+        elif current_pos <= -params["hard_short"]:
             sell_qty = 0
-            buy_qty = min(buy_cap, passive_clip + 4)
+            buy_qty = min(buy_cap, passive_clip + 8)
+            ask_quote += 3
 
         buy_qty = min(buy_qty, buy_cap)
         sell_qty = min(sell_qty, sell_cap)
+
+        debug_info[symbol] = {
+            "our_bid": bid_quote if buy_qty > 0 else None,
+            "our_ask": ask_quote if sell_qty > 0 else None,
+            "bid_size": buy_qty,
+            "ask_size": sell_qty,
+            "position": current_pos,
+            "regime": regime,
+            "signal": signal,
+            "centre": round(centre, 3),
+        }
 
         if buy_qty > 0:
             buy_used, sell_used = self.place_buy(
@@ -481,82 +538,52 @@ class Trader:
             buy_used, sell_used = self.place_sell(
                 orders, symbol, ask_quote, sell_qty, limit, pos, buy_used, sell_used
             )
-                
-    
+
         return buy_used, sell_used
-    
-
-    def momentum_root(self, order_depth, data, pos, orders, buy_used, sell_used):
-
+            
+    def root_signal_and_regime(self, data: Dict[str, Any]) -> Tuple[float, str]:
         symbol = "INTARIAN_PEPPER_ROOT"
-        limit = self.LIMITS[symbol]
-        params = self.PARAMS[symbol]
 
-
-        mid = self.mid_price(order_depth)
-        if mid is None:
-            return buy_used, sell_used
-
-        best_bid, best_ask = self.best_bid_ask(order_depth)
-
-        # --- update EMAs ---
         ema_fast = data["ema_fast"].get(symbol)
         ema_slow = data["ema_slow"].get(symbol)
-
-        if ema_fast is None or ema_slow is None:
-            return buy_used, sell_used
-
-        hist = data["price_hist"].get(symbol, [])
+        trend = 0.0 if ema_fast is None or ema_slow is None else (ema_fast - ema_slow)
         slope = 0.0
-        if len(hist) >= 6:
-            slope = mid - hist[-6]
+        hist = data["price_hist"].get(symbol, [])
+        window = 15
+        if len(hist) >= window:
+            y = hist[-window:]
+            x = list(range(window))
 
-        signal = (ema_fast - ema_slow) + 0.2 * slope
-        current_pos = pos + buy_used - sell_used
+            x_mean = sum(x) / window
+            y_mean = sum(y) / window
 
-        # --- target position ---
-        target_pos = int(signal * 8)
-        target_pos = max(-limit, min(limit, target_pos))
+            num = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y))
+            den = sum((xi - x_mean) ** 2 for xi in x)
 
-        # --- BUY LOGIC ---
-        if current_pos < target_pos and best_ask is not None:
+            slope = num / den if den != 0 else 0.0
 
-            need = target_pos - current_pos
+        signal = trend + 0.4 * slope
+        
+        regime = data.get("root_regime", "neutral")
+        if regime not in ("neutral", "long", "short"):
+            regime = "neutral"
 
-            # buy dip
-            if mid < ema_fast:
-                qty = min(10, need,
-                        self.remaining_buy_capacity(limit, pos, buy_used, sell_used))
+        # Hysteresis:
+        # enter long easier than short, and require stronger confirmation to enter short
+        if regime == "neutral":
+            if signal > 1.2:
+                regime = "long"
+            elif signal < -2.0:
+                regime = "short"
+        elif regime == "long":
+            if signal < 0.3:
+                regime = "neutral"
+        elif regime == "short":
+            if signal > -0.5:
+                regime = "neutral"
 
-                if qty > 0:
-                    buy_used, sell_used = self.place_buy(
-                        orders, symbol, best_ask, qty, limit, pos, buy_used, sell_used
-                    )
-
-            # strong trend → don't wait
-            elif signal > 2.0:
-                qty = min(10, need,
-                        self.remaining_buy_capacity(limit, pos, buy_used, sell_used))
-
-                if qty > 0:
-                    buy_used, sell_used = self.place_buy(
-                        orders, symbol, best_ask, qty, limit, pos, buy_used, sell_used
-                    )
-
-        # --- SELL LOGIC ---
-        elif current_pos > target_pos and best_bid is not None:
-
-            excess = current_pos - target_pos
-
-            qty = min(10, excess,
-                    self.remaining_sell_capacity(limit, pos, buy_used, sell_used))
-
-            if qty > 0:
-                buy_used, sell_used = self.place_sell(
-                    orders, symbol, best_bid, qty, limit, pos, buy_used, sell_used
-                )
-
-        return buy_used, sell_used
+        data["root_regime"] = regime
+        return signal, regime
 
     def carry_root(
         self,
@@ -570,93 +597,130 @@ class Trader:
 
         symbol = "INTARIAN_PEPPER_ROOT"
         limit = self.LIMITS[symbol]
-        params = self.PARAMS[symbol]
 
         mid = self.mid_price(order_depth)
         best_bid, best_ask = self.best_bid_ask(order_depth)
         if mid is None:
             return buy_used, sell_used
 
-        ema_fast = data["ema_fast"].get(symbol)
-        ema_slow = data["ema_slow"].get(symbol)
-        if ema_fast is None or ema_slow is None:
-            return buy_used, sell_used
-
-        trend = ema_fast - ema_slow
-        hist = data["price_hist"].get(symbol, [])
-        slope = 0.0
-        if len(hist) >= 5:
-            slope = mid - hist[-5]
-
-        signal = trend + 0.25 * slope
+        signal, regime = self.root_signal_and_regime(data)
         current_pos = pos + buy_used - sell_used
 
-        # regime-based target
-        if signal > 3.0:
-            target_pos = 70
-        elif signal > 2.0:
-            target_pos = 50
-        elif signal > 1.0:
-            target_pos = 25
-        elif signal > 0.4:
-            target_pos = 10
-        elif signal < -3.5:
-            target_pos = -20
-        elif signal < -2.0:
-            target_pos = -12
-        elif signal < -1.0:
-            target_pos = -6
+        # Asymmetric target positions:
+        # more willing to be long than short
+        if regime == "long":
+            if signal > 3.0:
+                target_pos = 70
+            elif signal > 2.0:
+                target_pos = 50
+            elif signal > 1.2:
+                target_pos = 25
+            else:
+                target_pos = 10
+        elif regime == "short":
+            if signal < -3.5:
+                target_pos = -20
+            elif signal < -2.5:
+                target_pos = -12
+            else:
+                target_pos = -6
         else:
             target_pos = 0
 
-        # UPTREND: accumulate and hold
+        # LONG REGIME: accumulate and hold
         if current_pos < target_pos:
             need = target_pos - current_pos
 
-            # cross only if strong signal
+            # Cross only if strong long signal
             if signal > 2.0 and best_ask is not None:
-                qty = min(need, 10, self.remaining_buy_capacity(limit, pos, buy_used, sell_used))
+                qty = min(
+                    need,
+                    10,
+                    self.remaining_buy_capacity(limit, pos, buy_used, sell_used),
+                )
                 if qty > 0:
                     buy_used, sell_used = self.place_buy(
                         orders, symbol, best_ask, qty, limit, pos, buy_used, sell_used
                     )
 
-            # passive bid for pullback accumulation
+            # Passive reload bid
             if best_bid is not None:
-                qty = min(need, 8, self.remaining_buy_capacity(limit, pos, buy_used, sell_used))
+                qty = min(
+                    need,
+                    8,
+                    self.remaining_buy_capacity(limit, pos, buy_used, sell_used),
+                )
                 if qty > 0:
                     buy_used, sell_used = self.place_buy(
                         orders, symbol, best_bid + 1, qty, limit, pos, buy_used, sell_used
                     )
 
-        # DOWNTREND: symmetric short logic
-        elif current_pos > target_pos:
+        # Above long target: trim gently, not aggressively
+        elif regime == "long" and current_pos > target_pos:
             excess = current_pos - target_pos
 
-            if signal < -2.0 and best_bid is not None:
-                qty = min(excess, 10, self.remaining_sell_capacity(limit, pos, buy_used, sell_used))
-                if qty > 0:
-                    buy_used, sell_used = self.place_sell(
-                        orders, symbol, best_bid, qty, limit, pos, buy_used, sell_used
-                    )
-
-            if best_ask is not None:
-                qty = min(excess, 8, self.remaining_sell_capacity(limit, pos, buy_used, sell_used))
+            if best_ask is not None and signal < 1.0:
+                qty = min(
+                    excess,
+                    5,
+                    self.remaining_sell_capacity(limit, pos, buy_used, sell_used),
+                )
                 if qty > 0:
                     buy_used, sell_used = self.place_sell(
                         orders, symbol, best_ask - 1, qty, limit, pos, buy_used, sell_used
                     )
 
-        return buy_used, sell_used
+        # SHORT REGIME: shorting is allowed, but much harder / smaller
+        elif regime == "short" and current_pos > target_pos:
+            excess = current_pos - target_pos
 
-    def trade_root(self, state: TradingState, data: Dict[str, Any]) -> List[Order]:
+            # Only cross to sell if strongly negative
+            if signal < -2.8 and best_bid is not None:
+                qty = min(
+                    excess,
+                    5,
+                    self.remaining_sell_capacity(limit, pos, buy_used, sell_used),
+                )
+                if qty > 0:
+                    buy_used, sell_used = self.place_sell(
+                        orders, symbol, best_bid, qty, limit, pos, buy_used, sell_used
+                    )
+
+            # Small passive ask only for reasonably strong short signal
+            elif signal < -2.0 and best_ask is not None:
+                qty = min(
+                    excess,
+                    3,
+                    self.remaining_sell_capacity(limit, pos, buy_used, sell_used),
+                )
+                if qty > 0:
+                    buy_used, sell_used = self.place_sell(
+                        orders, symbol, best_ask - 1, qty, limit, pos, buy_used, sell_used
+                    )
+
+        # If neutral and short, cover quickly
+        elif regime == "neutral" and current_pos < 0:
+            to_cover = -current_pos
+
+            if best_ask is not None:
+                qty = min(
+                    to_cover,
+                    8,
+                    self.remaining_buy_capacity(limit, pos, buy_used, sell_used),
+                )
+                if qty > 0:
+                    buy_used, sell_used = self.place_buy(
+                        orders, symbol, best_ask, qty, limit, pos, buy_used, sell_used
+                    )
+
+        return buy_used, sell_used
+    
+    def trade_root(self, state: TradingState, data: Dict[str, Any], debug_info: Dict[str, Any]) -> List[Order]:
         if "INTARIAN_PEPPER_ROOT" not in state.order_depths:
             return []
 
         order_depth = state.order_depths["INTARIAN_PEPPER_ROOT"]
         pos = self.get_position(state, "INTARIAN_PEPPER_ROOT")
-
-      
 
         params = self.PARAMS["INTARIAN_PEPPER_ROOT"]
         mid = self.mid_price(order_depth)
@@ -669,40 +733,38 @@ class Trader:
             )
             hist = data["price_hist"].setdefault("INTARIAN_PEPPER_ROOT", [])
             hist.append(mid)
-            if len(hist) > 20:
+            if len(hist) > 30:
                 hist.pop(0)
-
 
         fair = self.root_centre(order_depth, data)
         if fair is not None:
             data["root_centre"]["last_centre"] = fair
 
+        signal, regime = self.root_signal_and_regime(data)
+
         ema_fast = data["ema_fast"].get("INTARIAN_PEPPER_ROOT")
         ema_slow = data["ema_slow"].get("INTARIAN_PEPPER_ROOT")
         trend = 0.0 if ema_fast is None or ema_slow is None else (ema_fast - ema_slow)
-
-        best_bid, best_ask = self.best_bid_ask(order_depth)
-        spread = None if best_bid is None or best_ask is None else (best_ask - best_bid)
 
         orders: List[Order] = []
         buy_used = 0
         sell_used = 0
 
-        strong_trend = abs(trend) > 1.0
-        tight_book = spread is not None and spread <= 5
+        # Carry first if directional regime exists
+        if regime in ("long", "short"):
+            buy_used, sell_used = self.carry_root(
+                order_depth, data, pos, orders, buy_used, sell_used
+            )
 
-        if strong_trend:
-            buy_used, sell_used = self.carry_root(order_depth, data, pos, orders, buy_used, sell_used)
 
-            # only add passive MM if signal is not too strong
-            if abs(trend) < 2.5:
-                buy_used, sell_used = self.make_root(order_depth, data, pos, orders, buy_used, sell_used)
-        else:
-            buy_used, sell_used = self.make_root(order_depth, data, pos, orders, buy_used, sell_used)
+        buy_used, sell_used = self.make_root(
+            order_depth, data, pos, orders, buy_used, sell_used, debug_info
+        )
 
         logger.print(
             f"ROOT pos={pos} fair={fair if fair is None else round(fair, 3)} "
-            f"trend={round(trend, 3)} buy_used={buy_used} sell_used={sell_used} orders={orders}"
+            f"trend={round(trend, 3)} signal={round(signal, 3)} regime={regime} "
+            f"buy_used={buy_used} sell_used={sell_used} orders={orders}"
         )
         return orders
 
@@ -720,12 +782,11 @@ class Trader:
 
         # Full book available
         if micro is not None and mid is not None:
-            anchor = prev_fair if prev_fair is not None else mid
+            anchor = 10000
 
             fair = (
-                0.2 * micro
-                + 0.1 * mid
-                + 0.7 * anchor
+                0.4 * micro
+                + 0.6 * anchor
                 #+ params["imbalance_mult"] * 0.2 * imbalance
             )
             return fair
@@ -740,13 +801,12 @@ class Trader:
 
         # Final fallback if no previous fair exists
         if best_bid is not None:
-            return float(best_bid) - params["typical_spread"]//2
+            return 10000
         if best_ask is not None:
-            return float(best_ask) + params["typical_spread"]//2
+            return 10000
 
         return None
     
-
     def take_osmium(
             self, 
             order_depth: OrderDepth, 
@@ -796,7 +856,6 @@ class Trader:
                 break
 
         return buy_used, sell_used
-    
 
     def make_osmium(
             self, 
@@ -805,7 +864,8 @@ class Trader:
             orders: List[Order],
             pos: int,
             buy_used: int,
-            sell_used: int
+            sell_used: int,
+            debug_info: Dict[str, Any]
         ) -> Tuple[int, int]:
     
         limit = self.LIMITS["ASH_COATED_OSMIUM"]
@@ -844,9 +904,14 @@ class Trader:
         # reset anchors if they are on the wrong side of the book
 
         if bid_quote >= ask_quote:
-            centre = int(round(fair))
-            bid_quote = centre - 1
-            ask_quote = centre + 1
+            centre = 10000
+            bid_quote = centre - 4
+            ask_quote = centre + 4
+
+        if bid_quote >= 10000 or ask_quote <= 10000:
+            centre = 10000
+            bid_quote = centre - 4
+            ask_quote = centre + 4
             
         # if current pos is high but not above hard_pos --> increase size on the side that would reduce position and quote more towards fair
 
@@ -880,10 +945,17 @@ class Trader:
                 orders, "ASH_COATED_OSMIUM", ask_quote, sell_clip, limit, pos, buy_used, sell_used
             )
 
+        debug_info["ASH_COATED_OSMIUM"] = {
+        "our_bid": bid_quote,
+        "our_ask": ask_quote,
+        "bid_size": buy_clip,
+        "ask_size": sell_clip,
+        "position": current_pos,
+    }
+
         return buy_used, sell_used
     
-
-    def trade_osmium(self, state: TradingState, data: Dict[str, Any]) -> List[Order]:
+    def trade_osmium(self, state: TradingState, data: Dict[str, Any], debug_info: Dict[str, Any]) -> List[Order]:
         if "ASH_COATED_OSMIUM" not in state.order_depths:
             return []
 
@@ -899,7 +971,7 @@ class Trader:
             order_depth, data, orders, pos, buy_used, sell_used
         )
         buy_used, sell_used = self.make_osmium(
-            order_depth, data, orders, pos, buy_used, sell_used
+            order_depth, data, orders, pos, buy_used, sell_used, debug_info
         )
 
         logger.print(
@@ -910,17 +982,19 @@ class Trader:
 
     # ============================ RUN ==========================
 
+
     def run(self, state: TradingState):
         data = self.load_data(state.traderData)
         result: Dict[Symbol, List[Order]] = {}
+        debug_info: Dict[str, Any] = {}
 
         if "ASH_COATED_OSMIUM" in state.order_depths:
-            result["ASH_COATED_OSMIUM"] = self.trade_osmium(state, data)
+            result["ASH_COATED_OSMIUM"] = self.trade_osmium(state, data, debug_info)
 
-        if "INTARIAN_PEPPER_ROOT" in state.order_depths:
-            result["INTARIAN_PEPPER_ROOT"] = self.trade_root(state, data)
+        #if "INTARIAN_PEPPER_ROOT" in state.order_depths:
+            #result["INTARIAN_PEPPER_ROOT"] = self.trade_root(state, data, debug_info)
 
         trader_data = self.save_data(data)
         conversions = 0
-        logger.flush(state, result, conversions, trader_data)
+        logger.flush(state, result, conversions, trader_data, debug_info)
         return result, conversions, trader_data
