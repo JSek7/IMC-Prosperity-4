@@ -863,8 +863,8 @@ class Trader:
 
         if bid_quote >= ask_quote:
             centre = int(round(reservation))
-            bid_quote = centre - 3
-            ask_quote = centre + 3
+            bid_quote = centre - 4
+            ask_quote = centre + 4
 
         if bid_quote >= 10000 or ask_quote <= 10000:
             centre = 10000
